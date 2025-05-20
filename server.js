@@ -31,6 +31,12 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     const authToken = authHeader?.startsWith("Bearer ")
       ? authHeader.slice(7)
       : null;
+
+    // 🔒 AUTH GUARD (stop early if not logged in)
+    if (!authToken) {
+      console.warn("❌ No auth token provided.");
+      return res.status(401).json({ error: "Unauthorized" });
+    }
     const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
     const duration = parseFloat(req.body.duration);
     const estimatedTokens = Math.ceil(duration * 10);
@@ -133,7 +139,6 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       if (err) console.error("❌ Failed to delete temp mp3:", err);
       else console.log("🗑️ Deleted temp mp3:", mp3Path);
     });
-
 
     if (data && data.text) {
       const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
