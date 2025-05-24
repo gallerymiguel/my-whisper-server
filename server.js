@@ -25,7 +25,11 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
   try {
     console.log("📥 Incoming POST /transcribe");
     console.log("📎 File received:", req.file);
-    console.log("🕒 Duration received:", req.body.duration);
+    console.log(
+      "🕒 Timestamps received:",
+      req.body.startTime,
+      req.body.endTime
+    );
 
     const authHeader = req.headers.authorization;
     const authToken = authHeader?.startsWith("Bearer ")
@@ -38,9 +42,22 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
     const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
-    const duration = parseFloat(req.body.duration);
+
+    const startTime = req.body.startTime || "0:00";
+    const endTime = req.body.endTime || "0:00";
+    // Parse mm:ss into seconds
+    const timeToSeconds = (t) => {
+      const [min, sec] = t.split(":").map(Number);
+      return min * 60 + sec;
+    };
+
+    const start = timeToSeconds(startTime);
+    const end = timeToSeconds(endTime);
+    const duration = Math.max(end - start, 1); // Fallback to 1 second minimum
+
     const estimatedTokens = Math.ceil(duration * 10);
-    console.log("🧮 Estimated tokens from duration:", estimatedTokens);
+    console.log("🕒 Parsed duration:", duration);
+    console.log("🧮 Estimated tokens from timestamps:", estimatedTokens);
 
     // Check usage before transcription
     const usageResponse = await fetch(GRAPHQL_URL, {
@@ -90,11 +107,37 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
         })
         .run();
     });
+    // After MP3 conversion
+    const slicedPath = path.resolve(`uploads/${req.file.filename}-sliced.mp3`);
+
+    if (!isNaN(start) && !isNaN(end) && end > start) {
+      console.log(`✂️ Slicing MP3 from ${start}s to ${end}s...`);
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(mp3Path)
+          .setStartTime(start)
+          .duration(duration)
+          .output(slicedPath)
+          .on("end", () => {
+            console.log("✅ Slicing complete:", slicedPath);
+            resolve();
+          })
+          .on("error", (err) => {
+            console.error("❌ FFmpeg slicing error:", err);
+            reject(err);
+          })
+          .run();
+      });
+    } else {
+      console.warn("⚠️ Invalid timestamps; skipping slicing.");
+    }
 
     console.log("🚀 Uploading MP3 to OpenAI...");
 
     const formData = new FormData();
-    formData.append("file", fs.createReadStream(mp3Path));
+    const finalUploadPath = fs.existsSync(slicedPath) ? slicedPath : mp3Path;
+    formData.append("file", fs.createReadStream(finalUploadPath));
+
     formData.append("model", "whisper-1");
 
     const response = await fetch(
@@ -127,7 +170,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       fs.mkdirSync(debugDir);
     }
     const debugPath = path.resolve(debugDir, `${req.file.filename}.mp3`);
-    fs.copyFileSync(mp3Path, debugPath);
+    fs.copyFileSync(finalUploadPath, debugPath);
     console.log("💾 Saved MP3 backup to:", debugPath);
 
     fs.unlink(originalPath, (err) => {
@@ -138,6 +181,11 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     fs.unlink(mp3Path, (err) => {
       if (err) console.error("❌ Failed to delete temp mp3:", err);
       else console.log("🗑️ Deleted temp mp3:", mp3Path);
+    });
+
+    fs.unlink(slicedPath, (err) => {
+      if (err) console.error("❌ Failed to delete sliced mp3:", err);
+      else console.log("🗑️ Deleted sliced mp3:", slicedPath);
     });
 
     if (data && data.text) {
