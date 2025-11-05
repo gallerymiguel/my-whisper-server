@@ -41,8 +41,8 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       console.warn("❌ No auth token provided.");
       return res.status(401).json({ error: "Unauthorized" });
     }
+    
     const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
-
     const startTime = req.body.startTime || "0:00";
     const endTime = req.body.endTime || "0:00";
     // Parse mm:ss into seconds
