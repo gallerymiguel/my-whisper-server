@@ -10,6 +10,28 @@ import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 
 dotenv.config();
+// =======================
+// Demo mode limits
+// =======================
+const DEMO_REQUESTS_PER_DAY = 1;
+
+// key: `${YYYY-MM-DD}:${ip}` -> count
+const demoRequestsByIp = new Map();
+
+function getDateKeyUTC() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function getClientIp(req) {
+  // app.set("trust proxy", 1) is already in your code ✅
+  return (req.ip || "").replace(/^::ffff:/, "") || "unknown";
+}
+
+function parseMmSsToSeconds(t) {
+  const match = /^(\d{1,2}):([0-5]?\d)$/.exec(String(t || "").trim());
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
 
 console.log("✅ Server started. Waiting for uploads...");
 const app = express();
@@ -20,7 +42,8 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 
 app.use(cors());
 app.use(express.json());
-
+app.set("trust proxy", 1); // trust first proxy
+// =================================================================== EXPRESS ROUTE
 app.post("/transcribe", upload.single("audio"), async (req, res) => {
   try {
     console.log("📥 Incoming POST /transcribe");
@@ -30,58 +53,92 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       req.body.startTime,
       req.body.endTime
     );
-
+// =======================
     const authHeader = req.headers.authorization;
     const authToken = authHeader?.startsWith("Bearer ")
       ? authHeader.slice(7)
       : null;
 
     // 🔒 AUTH GUARD (stop early if not logged in)
+    const ip = getClientIp(req);
+    const dateKey = getDateKeyUTC();
+    const demoKey = `${dateKey}:${ip}`;
+
+    // ✅ Demo mode: no auth token
     if (!authToken) {
-      console.warn("❌ No auth token provided.");
-      return res.status(401).json({ error: "Unauthorized" });
+      const used = demoRequestsByIp.get(demoKey) || 0;
+
+      if (used >= DEMO_REQUESTS_PER_DAY) {
+        console.warn("🚫 Demo limit reached for IP:", ip);
+        return res.status(403).json({
+          error: "DEMO_LIMIT",
+          details:
+            "Demo limit reached (1 per day). Please subscribe or try again tomorrow.",
+          demo: { dailyLimit: DEMO_REQUESTS_PER_DAY, used },
+        });
+      }
+      // Reserve usage now (counts even if they spam-click)
+      record.usedSeconds += duration;
+      demoUsageByIp.set(demoKey, record);
+
+      console.log("🧪 Demo mode allowed:", {
+        ip,
+        dateKey,
+        requestedSeconds: duration,
+        usedSecondsToday: record.usedSeconds,
+        remainingSeconds: DEMO_SECONDS_PER_DAY - record.usedSeconds,
+      });
     }
-    
-    const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
+
+    // const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
     const startTime = req.body.startTime || "0:00";
     const endTime = req.body.endTime || "0:00";
-    // Parse mm:ss into seconds
-    const timeToSeconds = (t) => {
-      const [min, sec] = t.split(":").map(Number);
-      return min * 60 + sec;
-    };
 
-    const start = timeToSeconds(startTime);
-    const end = timeToSeconds(endTime);
-    const duration = Math.max(end - start, 1); // Fallback to 1 second minimum
+    const start = parseMmSsToSeconds(startTime);
+    const end = parseMmSsToSeconds(endTime);
+
+    if (start === null || end === null || end <= start) {
+      return res.status(400).json({
+        error: "Invalid timestamps",
+        details:
+          "startTime/endTime must be mm:ss and endTime must be after startTime.",
+      });
+    }
+
+    const duration = end - start; // real requested seconds
 
     const estimatedTokens = Math.ceil(duration * 10);
     console.log("🕒 Parsed duration:", duration);
     console.log("🧮 Estimated tokens from timestamps:", estimatedTokens);
 
     // Check usage before transcription
-    const usageResponse = await fetch(GRAPHQL_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${authToken}`,
-      },
-      body: JSON.stringify({
-        query: `query { getUsageCount }`,
-      }),
-    });
+    if (authToken) {
+      const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
 
-    const usageData = await usageResponse.json();
-    const currentUsage = usageData?.data?.getUsageCount ?? 0;
+      const estimatedTokens = Math.ceil(duration * 10);
+      console.log("🧮 Estimated tokens from timestamps:", estimatedTokens);
 
-    console.log("📊 Usage check:", { currentUsage, estimatedTokens });
-
-    if (currentUsage + estimatedTokens > 8000) {
-      console.warn("🚫 Usage limit exceeded.");
-      return res.status(403).json({
-        error: "Usage limit exceeded.",
-        code: "USAGE_LIMIT_REACHED",
+      const usageResponse = await fetch(GRAPHQL_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ query: `query { getUsageCount }` }),
       });
+
+      const usageData = await usageResponse.json();
+      const currentUsage = usageData?.data?.getUsageCount ?? 0;
+
+      console.log("📊 Usage check:", { currentUsage, estimatedTokens });
+
+      if (currentUsage + estimatedTokens > 8000) {
+        console.warn("🚫 Usage limit exceeded.");
+        return res.status(403).json({
+          error: "Usage limit exceeded.",
+          code: "USAGE_LIMIT_REACHED",
+        });
+      }
     }
 
     if (!req.file) {
@@ -92,7 +149,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     const mp3Path = path.resolve(`uploads/${req.file.filename}.mp3`);
 
     console.log("🎛️ Converting webm to mp3...");
-
+// ============================================= FFMPEG CONVERSION 
     await new Promise((resolve, reject) => {
       ffmpeg(originalPath)
         .output(mp3Path)
@@ -107,6 +164,8 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
         })
         .run();
     });
+    // =======================
+    
     // After MP3 conversion
     const slicedPath = path.resolve(`uploads/${req.file.filename}-sliced.mp3`);
 
@@ -139,7 +198,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     formData.append("file", fs.createReadStream(finalUploadPath));
 
     formData.append("model", "whisper-1");
-
+// ==================================================== WHISPER API CALL
     const response = await fetch(
       "https://api.openai.com/v1/audio/transcriptions",
       {
@@ -151,7 +210,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
         body: formData,
       }
     );
-
+// =======================  
     const raw = await response.text();
     let data;
 
@@ -164,7 +223,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
         .status(500)
         .json({ error: "Could not parse Whisper response." });
     }
-
+// ==================================================================== CLEAN UP
     const debugDir = path.resolve("debug");
     if (!fs.existsSync(debugDir)) {
       fs.mkdirSync(debugDir);
@@ -187,7 +246,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       if (err) console.error("❌ Failed to delete sliced mp3:", err);
       else console.log("🗑️ Deleted sliced mp3:", slicedPath);
     });
-
+//===================================================================
     if (data && data.text) {
       const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
       const estimatedTokens = Math.ceil(data.text.split(" ").length / 0.75);
@@ -197,6 +256,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
         amount: estimatedTokens,
       });
       // ✅ Inform the Chrome Extension (if needed)
+    // ================================================================== ESTIMATED TOKENS FROM TRANSCRIPTION
       if (globalThis.chrome?.runtime?.sendMessage) {
         chrome.runtime.sendMessage({
           type: "TRANSCRIPT_FETCHED",
@@ -204,26 +264,42 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
           estimatedTokenCount: estimatedTokens, // ✅ pass to background.js
         });
       }
+// ==========================================
+      if (authToken) {
+        const GRAPHQL_URL = process.env.BACKEND_GRAPHQL_URL;
 
-      await fetch(GRAPHQL_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({
-          query: `
-            mutation IncrementUsage($amount: Int!) {
-              incrementUsage(amount: $amount)
-            }
-          `,
-          variables: {
-            amount: estimatedTokens,
+        await fetch(GRAPHQL_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${authToken}`,
           },
-        }),
-      });
+          body: JSON.stringify({
+            query: `
+        mutation IncrementUsage($amount: Int!) {
+          incrementUsage(amount: $amount)
+        }
+      `,
+            variables: { amount: estimatedTokens },
+          }),
+        });
+      }
 
-      res.json({ transcript: data.text, estimatedTokens });
+      const demoInfo = !authToken
+        ? (() => {
+            const r = demoUsageByIp.get(demoKey);
+            return {
+              dailyLimitSeconds: DEMO_SECONDS_PER_DAY,
+              usedSeconds: r?.usedSeconds ?? 0,
+              remainingSeconds: Math.max(
+                0,
+                DEMO_SECONDS_PER_DAY - (r?.usedSeconds ?? 0)
+              ),
+            };
+          })()
+        : null;
+
+      res.json({ transcript: data.text, estimatedTokens, demo: demoInfo });
     } else {
       console.error("❌ Whisper API returned no transcript:", data);
       res.status(500).json({ error: "Whisper API failed", details: data });
