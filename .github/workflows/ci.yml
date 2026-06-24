@@ -21,6 +21,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Start server
+        run: |
+          PORT=3100 npm start &
+          echo $! > server.pid
+
+      - name: Check health endpoint
+        run: |
+          for i in {1..10}; do
+            if curl --fail --silent http://127.0.0.1:3100/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Health check failed"
+          exit 1
+
       - name: Skip lint
         run: echo "No lint script exists for this project."
 

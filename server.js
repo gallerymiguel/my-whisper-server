@@ -43,6 +43,11 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 app.use(cors());
 app.use(express.json());
 app.set("trust proxy", 1); // trust first proxy
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok" });
+});
+
 // =================================================================== EXPRESS ROUTE
 app.post("/transcribe", upload.single("audio"), async (req, res) => {
   try {
