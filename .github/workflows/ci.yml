@@ -1,0 +1,31 @@
+name: Whisper Server CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Skip lint
+        run: echo "No lint script exists for this project."
+
+      - name: Skip tests
+        run: echo "No test script exists for this project."
+
+      - name: Skip build
+        run: echo "No build script exists for this project."
